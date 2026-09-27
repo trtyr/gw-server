@@ -15,18 +15,20 @@ from __future__ import annotations
 import logging
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import config
+from .mcp_server import mcp, tokens
 from .tokens import (
     SERVICE_ROUTES,
     TokenError,
-    TokenManager,
     TokenNotFound,
     build_url,
     normalize_email,
@@ -50,7 +52,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("gw.server")
 
-tokens = TokenManager(config.tokens_dir, forced_mode=config.auth_mode)
+# MCP app + lifespan bridge: the session manager's task group must be running
+# before any /mcp request; Starlette does not run lifespans of mounted sub-apps,
+# so we re-enter mcp_app's own lifespan from FastAPI's. Using mcp_app's own
+# lifespan (instead of the lowlevel server's _session_manager) guarantees the
+# manager being run is exactly the one this app instance serves with.
+mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True)
+_mcp_lifespan = mcp_app.router.lifespan_context
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    async with _mcp_lifespan(app):
+        yield
+
 
 app = FastAPI(
     title="gw-server",
@@ -58,6 +73,7 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=_lifespan,
 )
 
 MAX_TIMEOUT_S = 300.0
@@ -69,6 +85,36 @@ DROP_HEADERS = {"authorization", "host", "cookie", "content-length"}
 # --------------------------------------------------------------------------
 # auth
 # --------------------------------------------------------------------------
+
+
+class BearerASGIMiddleware:
+    """Guard for the mounted MCP app (FastAPI middleware does not apply to mounts)."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            headers = {k.lower(): v for k, v in scope.get("headers") or []}
+            auth = headers.get(b"authorization", b"").decode("latin-1")
+            ok = auth.startswith("Bearer ") and secrets.compare_digest(
+                auth[len("Bearer "):], config.gw_token
+            )
+            if not ok:
+                await JSONResponse(
+                    {"ok": False, "error": "unauthorized"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Mount the MCP server (Streamable HTTP) behind bearer auth.
+# Mounted at "/" so the MCP-internal route ("/mcp") resolves directly;
+# explicit API routes above take precedence. NOTE: reuse mcp_app — calling
+# streamable_http_app() again would create a second, un-started session manager.
+app.mount("/", BearerASGIMiddleware(mcp_app))
 
 def require_bearer(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):

@@ -5,6 +5,7 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
+    "mcp[cli]>=2.2.0",
     "uvicorn[standard]>=0.54.0",
 ]
 

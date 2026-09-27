@@ -10,10 +10,9 @@ from pathlib import Path
 # Mirrors google-workspace skill common.js (cloud auth mode).
 DEFAULT_CLOUD_FUNCTION_URL = "https://google-workspace-extension.geminicli.com"
 
-CONFIG_DIR = Path(
-    os.environ.get("GOOGLE_WORKSPACE_CONFIG_DIR")
-    or Path.home() / ".pi" / "google-workspace"
-)
+# gw-server's own data directory — tokens & OAuth client live here, NOT under
+# any other tool's namespace (the old ~/.pi/google-workspace path is retired).
+CONFIG_DIR = Path(os.environ.get("GW_CONFIG_DIR") or Path.home() / ".gw-server")
 
 
 @dataclass(frozen=True)
@@ -63,12 +62,10 @@ class Config:
         return cls(
             gw_token=gw_token,
             tokens_dir=Path(
-                os.environ.get("GOOGLE_WORKSPACE_TOKENS_DIR")
-                or CONFIG_DIR / "tokens"
+                os.environ.get("GW_TOKENS_DIR") or CONFIG_DIR / "tokens"
             ),
             credentials_path=Path(
-                os.environ.get("GOOGLE_WORKSPACE_CREDENTIALS")
-                or CONFIG_DIR / "credentials.json"
+                os.environ.get("GW_CREDENTIALS") or CONFIG_DIR / "credentials.json"
             ),
             auth_mode=mode or None,
             host=os.environ.get("GW_HOST", "127.0.0.1"),

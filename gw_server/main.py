@@ -61,7 +61,12 @@ log = logging.getLogger("gw.server")
 # so we re-enter mcp_app's own lifespan from FastAPI's. Using mcp_app's own
 # lifespan (instead of the lowlevel server's _session_manager) guarantees the
 # manager being run is exactly the one this app instance serves with.
-mcp_app = mcp.streamable_http_app(stateless_http=True, json_response=True)
+# host=config.host: on 127.0.0.1 the SDK enables DNS-rebinding protection
+# (Host must be localhost); on 0.0.0.0 (production behind EdgeOne/Caddy) it
+# stays off so the proxy's Host header (gw.trtyr.top) is accepted.
+mcp_app = mcp.streamable_http_app(
+    stateless_http=True, json_response=True, host=config.host
+)
 _mcp_lifespan = mcp_app.router.lifespan_context
 
 

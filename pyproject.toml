@@ -1,0 +1,17 @@
+[project]
+name = "gw-server"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+gw-server = "gw_server.main:serve"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+

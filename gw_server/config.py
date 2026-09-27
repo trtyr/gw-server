@@ -1,0 +1,60 @@
+"""gw-server configuration (env-driven, fail-closed on missing GW_TOKEN)."""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+
+# Mirrors google-workspace skill common.js (cloud auth mode).
+DEFAULT_CLOUD_FUNCTION_URL = "https://google-workspace-extension.geminicli.com"
+
+CONFIG_DIR = Path(
+    os.environ.get("GOOGLE_WORKSPACE_CONFIG_DIR")
+    or Path.home() / ".pi" / "google-workspace"
+)
+
+
+@dataclass(frozen=True)
+class Config:
+    gw_token: str
+    tokens_dir: Path
+    credentials_path: Path
+    auth_mode: str | None  # "local" | "cloud" | None (auto per token file)
+    host: str
+    port: int
+    cloud_fn_url: str
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        gw_token = os.environ.get("GW_TOKEN", "").strip()
+        if not gw_token:
+            raise SystemExit(
+                "gw-server: GW_TOKEN is not set. "
+                "Generate one (e.g. `openssl rand -hex 32`) and export GW_TOKEN."
+            )
+
+        mode = os.environ.get("GW_AUTH_MODE", "").strip().lower()
+        if mode not in ("", "local", "cloud"):
+            raise SystemExit("gw-server: GW_AUTH_MODE must be '', 'local' or 'cloud'.")
+
+        return cls(
+            gw_token=gw_token,
+            tokens_dir=Path(
+                os.environ.get("GOOGLE_WORKSPACE_TOKENS_DIR")
+                or CONFIG_DIR / "tokens"
+            ),
+            credentials_path=Path(
+                os.environ.get("GOOGLE_WORKSPACE_CREDENTIALS")
+                or CONFIG_DIR / "credentials.json"
+            ),
+            auth_mode=mode or None,
+            host=os.environ.get("GW_HOST", "127.0.0.1"),
+            port=int(os.environ.get("GW_PORT", "8787")),
+            cloud_fn_url=os.environ.get(
+                "GW_CLOUD_FN_URL", DEFAULT_CLOUD_FUNCTION_URL
+            ).rstrip("/"),
+        )
+
+
+config = Config.from_env()

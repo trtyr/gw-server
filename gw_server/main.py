@@ -266,7 +266,7 @@ async def exec_api(
 # GW_PUBLIC_URL=https://gw.trtyr.top and the whole flow works from a link.
 # --------------------------------------------------------------------------
 
-_pending_oauth: dict[str, tuple[str, float]] = {}  # csrf -> (email, expires_at monotonic)
+_pending_oauth: dict[str, dict[str, Any]] = {}  # csrf -> {email, expires_at, mode, redirect_uri}
 OAUTH_PENDING_TTL_S = 600
 
 
@@ -278,39 +278,60 @@ async def oauth_login(
     email = normalize_email(email)
 
     now = time.monotonic()
-    for k in [k for k, (_, exp) in _pending_oauth.items() if exp < now]:
+    for k in [k for k, v in _pending_oauth.items() if v["expires_at"] < now]:
         _pending_oauth.pop(k, None)
 
+    client = config.oauth_client
+    mode = "local" if client else "cloud"
     csrf = secrets.token_hex(32)
-    _pending_oauth[csrf] = (email, now + OAUTH_PENDING_TTL_S)
+    redirect_uri = f"{config.public_url}/oauth/callback"
 
-    state = base64.b64encode(
-        json.dumps(
+    if mode == "local":
+        # Standard authorization-code flow with OUR client: Google redirects
+        # straight back to us with ?code=..., we exchange it for tokens.
+        client_id, _ = client  # type: ignore[misc]
+        state = csrf
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(
             {
-                "uri": f"{config.public_url}/oauth/callback",
-                "manual": False,
-                "csrf": csrf,
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "access_type": "offline",
+                "scope": " ".join(DEFAULT_SCOPES),
+                "state": state,
+                "prompt": "consent",
             }
-        ).encode()
-    ).decode()
+        )
+    else:
+        # Legacy cloud mode via the public geminicli extension client.
+        state = base64.b64encode(
+            json.dumps({"uri": redirect_uri, "manual": False, "csrf": csrf}).encode()
+        ).decode()
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(
+            {
+                "client_id": DEFAULT_CLIENT_ID,
+                "redirect_uri": config.cloud_fn_url,
+                "response_type": "code",
+                "access_type": "offline",
+                "scope": " ".join(DEFAULT_SCOPES),
+                "state": state,
+                "prompt": "consent",
+            }
+        )
 
-    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(
-        {
-            "client_id": DEFAULT_CLIENT_ID,
-            "redirect_uri": config.cloud_fn_url,
-            "response_type": "code",
-            "access_type": "offline",
-            "scope": " ".join(DEFAULT_SCOPES),
-            "state": state,
-            "prompt": "consent",
-        }
-    )
-    log.info("oauth login initiated for %s (callback %s)", email, config.public_url)
+    _pending_oauth[csrf] = {
+        "email": email,
+        "expires_at": now + OAUTH_PENDING_TTL_S,
+        "mode": mode,
+        "redirect_uri": redirect_uri,
+    }
+    log.info("oauth login initiated for %s (mode=%s, callback %s)", email, mode, redirect_uri)
     return {
         "ok": True,
         "email": email,
+        "mode": mode,
         "url": auth_url,
-        "callbackUrl": f"{config.public_url}/oauth/callback",
+        "callbackUrl": redirect_uri,
         "expiresIn": OAUTH_PENDING_TTL_S,
         "hint": "Open this URL in any browser, complete Google consent; "
         "the token lands on this server automatically.",
@@ -333,28 +354,74 @@ async def oauth_callback(request: Request) -> HTMLResponse:
         except Exception:
             csrf = ""
     pending = _pending_oauth.pop(csrf, None) if csrf else None
-    if pending is None or pending[1] < time.monotonic():
+    if pending is None or pending["expires_at"] < time.monotonic():
         return HTMLResponse(
             "<h1>❌ Invalid or expired OAuth state</h1><p>Re-initiate login.</p>",
             status_code=400,
         )
-    email = pending[0]
+    email = pending["email"]
+    mode = pending["mode"]
 
     if qs.get("error"):
         return HTMLResponse(
             f"<h1>❌ Authentication failed: {qs['error']}</h1>", status_code=400
         )
-    access = qs.get("access_token")
-    expiry_raw = qs.get("expiry_date")
-    if not access or not expiry_raw:
-        return HTMLResponse(
-            "<h1>❌ Callback did not include tokens</h1>", status_code=400
-        )
+
+    creds: dict[str, Any]
+    if mode == "local":
+        # Standard code flow: exchange the authorization code for tokens.
+        code = qs.get("code")
+        if not code:
+            return HTMLResponse("<h1>❌ Callback missing code</h1>", status_code=400)
+        client = config.oauth_client
+        if not client:
+            return HTMLResponse("<h1>❌ Own OAuth client not configured</h1>", status_code=500)
+        client_id, client_secret = client
+        async with httpx.AsyncClient(timeout=20) as tc:
+            tok = await tc.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri": pending["redirect_uri"],
+                    "grant_type": "authorization_code",
+                },
+            )
+        if tok.status_code >= 400 or not tok.json().get("access_token"):
+            return HTMLResponse(
+                f"<h1>❌ Token exchange failed</h1><pre>{tok.text[:300]}</pre>",
+                status_code=400,
+            )
+        body = tok.json()
+        creds = {
+            "access_token": body["access_token"],
+            "refresh_token": body.get("refresh_token"),
+            "scope": body.get("scope"),
+            "token_type": body.get("token_type", "Bearer"),
+            "expiry_date": int(time.time() * 1000) + int(body.get("expires_in", 3600)) * 1000,
+            "__authMode": "local",
+        }
+    else:
+        access = qs.get("access_token")
+        expiry_raw = qs.get("expiry_date")
+        if not access or not expiry_raw:
+            return HTMLResponse(
+                "<h1>❌ Callback did not include tokens</h1>", status_code=400
+            )
+        creds = {
+            "access_token": access,
+            "refresh_token": qs.get("refresh_token"),
+            "scope": qs.get("scope"),
+            "token_type": qs.get("token_type", "Bearer"),
+            "expiry_date": int(expiry_raw),
+            "__authMode": "cloud",
+        }
 
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(
             "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access}"},
+            headers={"Authorization": f"Bearer {creds['access_token']}"},
         )
     if resp.status_code != 200:
         return HTMLResponse(
@@ -368,20 +435,11 @@ async def oauth_callback(request: Request) -> HTMLResponse:
             status_code=400,
         )
 
-    tokens.save(
-        email,
-        {
-            "access_token": access,
-            "refresh_token": qs.get("refresh_token"),
-            "scope": qs.get("scope"),
-            "token_type": qs.get("token_type", "Bearer"),
-            "expiry_date": int(expiry_raw),
-        },
-    )
-    log.info("oauth login complete for %s", email)
+    tokens.save(email, creds)
+    log.info("oauth login complete for %s (%s, %d scopes)", email, mode, len((creds.get("scope") or "").split()))
     return HTMLResponse(
         f"<h1>✅ Login successful for {email}</h1>"
-        f"<p>Token stored on the server. You can close this tab.</p>"
+        f"<p>Token stored on the server ({mode} mode). You can close this tab.</p>"
     )
 
 

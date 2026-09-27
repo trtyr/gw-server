@@ -1,7 +1,8 @@
-"""MCP tool surface — what this service actually DOES for AI clients.
+"""MCP tool surface core: server instance + shared helpers.
 
-pi (or any MCP client) connects via Streamable HTTP + Bearer and discovers
-these tools directly: no REST knowledge, no googleapis, no node CLI.
+Tool modules (tools_gmail / tools_drive / tools_calendar / tools_workspace)
+register their tools onto the same `mcp` instance and are imported at the
+bottom of this file.
 """
 
 from __future__ import annotations
@@ -18,21 +19,24 @@ from .tokens import DEFAULT_VERSIONS, TokenError, TokenManager, TokenNotFound, b
 mcp = MCPServer(
     "gw",
     instructions=(
-        "Google Workspace toolset (Gmail / Drive / Calendar / Docs / Chat / Sheets / Slides). "
-        "Multi-account: pass `email` to pick an account; omit it when only one account is signed in. "
-        "`gapi` is the generic escape hatch for any Google REST endpoint; the named tools cover "
-        "the common operations."
+        "Google Workspace toolset: Gmail / Drive / Calendar / Docs / Sheets / Slides / "
+        "Chat / Tasks / Contacts. Multi-account: pass `email` to pick an account; omit it "
+        "when only one account is signed in. `gapi` is the generic escape hatch for any "
+        "Google REST endpoint; the named tools cover common operations."
     ),
 )
 
 tokens = TokenManager(config.tokens_dir, forced_mode=config.auth_mode)
 
+MAX_TEXT = 100_000  # max chars of file/mail body returned to the client
+
+
 # ---------------------------------------------------------------------------
-# helpers
+# helpers (shared by tool modules)
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_email(email: str | None) -> str:
+async def resolve_email(email: str | None) -> str:
     if email:
         return normalize_email(email)
     accounts = tokens.list_accounts()
@@ -40,12 +44,12 @@ async def _resolve_email(email: str | None) -> str:
         return accounts[0]["email"]
     if not accounts:
         raise ValueError(
-            "no accounts signed in on the server; run `uv run python -m gw_server.login --email <addr>` on the host"
+            "no accounts signed in on the server; initiate login via /oauth/login"
         )
     raise ValueError(f"multiple accounts signed in, pass email: {[a['email'] for a in accounts]}")
 
 
-async def _gapi(
+async def gapi_call(
     email: str,
     service: str,
     path: str,
@@ -53,19 +57,23 @@ async def _gapi(
     params: dict[str, Any] | None = None,
     body: Any = None,
     version: str | None = None,
+    raw_body: bytes | None = None,
+    raw_content_type: str | None = None,
 ) -> dict[str, Any]:
     """In-process Google REST call with auto-refreshed OAuth token."""
     access = await tokens.access_token(email)
     url = build_url(service, path, version)
     clean_params = {k: v for k, v in (params or {}).items() if v is not None}
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.request(
-            method,
-            url,
-            params=clean_params,
-            json=body,
-            headers={"Authorization": f"Bearer {access}", "Accept": "application/json"},
-        )
+    headers = {"Authorization": f"Bearer {access}", "Accept": "application/json"}
+    kwargs: dict[str, Any] = {"params": clean_params, "headers": headers}
+    if raw_body is not None:
+        kwargs["content"] = raw_body
+        if raw_content_type:
+            headers["Content-Type"] = raw_content_type
+    elif body is not None:
+        kwargs["json"] = body
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.request(method, url, **kwargs)
     if "application/json" in resp.headers.get("content-type", ""):
         try:
             data: Any = resp.json()
@@ -82,40 +90,66 @@ async def _gapi(
     return result
 
 
-def _extract_text_body(payload: dict[str, Any]) -> str:
-    """Best-effort plain-text extraction from a Gmail message payload."""
+def ok(email: str, **fields: Any) -> dict[str, Any]:
+    return {"ok": True, "email": email, **fields}
 
-    def decode(part: dict[str, Any]) -> str | None:
-        data = (part.get("body") or {}).get("data")
-        if not data:
-            return None
-        try:
-            return base64.urlsafe_b64decode(data + "===").decode("utf-8", "replace")
-        except Exception:
-            return None
+
+def err(result: dict[str, Any], email: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "email": email,
+        "status": result.get("status"),
+        "error": result.get("error") or result.get("data"),
+    }
+
+
+def decode_b64url(data: str) -> str:
+    try:
+        return base64.urlsafe_b64decode(data + "===").decode("utf-8", "replace")
+    except Exception:
+        return "(undecodable)"
+
+
+def extract_text_body(payload: dict[str, Any]) -> str:
+    """Best-effort plain-text extraction from a Gmail message payload."""
 
     def walk(node: dict[str, Any]) -> str | None:
         mime = node.get("mimeType", "")
-        if mime == "text/plain":
-            text = decode(node)
-            if text:
-                return text
+        if mime == "text/plain" and (node.get("body") or {}).get("data"):
+            return decode_b64url(node["body"]["data"])
         for child in node.get("parts", []) or []:
             text = walk(child)
             if text:
                 return text
-        if mime == "text/html":
-            return decode(node)
+        if mime == "text/html" and (node.get("body") or {}).get("data"):
+            return decode_b64url(node["body"]["data"])
         return None
 
-    return walk(payload or {}) or "(no text body)"
+    return (walk(payload or {}) or "(no text body)")[:MAX_TEXT]
 
 
-def _message_summary(m: dict[str, Any]) -> dict[str, Any]:
+def _iter_parts(node: dict[str, Any]):
+    yield node
+    for child in node.get("parts", []) or []:
+        yield from _iter_parts(child)
+
+
+def message_summary(m: dict[str, Any]) -> dict[str, Any]:
     headers = {
         h["name"].lower(): h["value"]
         for h in (m.get("payload") or {}).get("headers", [])
     }
+    attachments = []
+    for part in _iter_parts(m.get("payload") or {}):
+        if part.get("filename") and (part.get("body") or {}).get("attachmentId"):
+            attachments.append(
+                {
+                    "filename": part["filename"],
+                    "attachmentId": part["body"]["attachmentId"],
+                    "mimeType": part.get("mimeType"),
+                    "size": (part.get("body") or {}).get("size"),
+                }
+            )
     return {
         "id": m.get("id"),
         "threadId": m.get("threadId"),
@@ -125,143 +159,29 @@ def _message_summary(m: dict[str, Any]) -> dict[str, Any]:
         "date": headers.get("date"),
         "snippet": m.get("snippet"),
         "labels": m.get("labelIds"),
+        "attachments": attachments,
     }
 
 
 # ---------------------------------------------------------------------------
-# tools
+# core tools
 # ---------------------------------------------------------------------------
 
 
 @mcp.tool()
 async def accounts_list() -> dict[str, Any]:
     """List Google accounts signed in on this server (no secrets)."""
-    accounts = tokens.list_accounts()
-    return {"ok": True, "accounts": accounts}
+    return {"ok": True, "accounts": tokens.list_accounts()}
 
 
 @mcp.tool()
 async def whoami(email: str | None = None) -> dict[str, Any]:
     """Return the Google identity (email, name, picture) for an account."""
-    email = await _resolve_email(email)
-    result = await _gapi(email, "oauth2", "/userinfo")
+    email = await resolve_email(email)
+    result = await gapi_call(email, "oauth2", "/userinfo")
     if not result["ok"]:
-        return result
-    return {"ok": True, "email": email, "identity": result["data"]}
-
-
-@mcp.tool()
-async def gmail_search(
-    query: str = "in:inbox",
-    email: str | None = None,
-    max_results: int = 10,
-) -> dict[str, Any]:
-    """Search Gmail messages. `query` is Gmail search syntax (e.g. "from:alice", "has:attachment newer_than:7d", "in:inbox"). Returns summaries; follow up with gmail_read for full content."""
-    email = await _resolve_email(email)
-    result = await _gapi(
-        email,
-        "gmail",
-        "/users/me/messages",
-        params={"q": query, "maxResults": max(1, min(max_results, 50))},
-    )
-    if not result["ok"]:
-        return result
-    return {"ok": True, "email": email, "messages": result["data"].get("messages", [])}
-
-
-@mcp.tool()
-async def gmail_read(message_id: str, email: str | None = None) -> dict[str, Any]:
-    """Read one Gmail message in full: headers, snippet and extracted text body."""
-    email = await _resolve_email(email)
-    result = await _gapi(email, "gmail", f"/users/me/messages/{message_id}")
-    if not result["ok"]:
-        return result
-    full = result["data"]
-    return {
-        "ok": True,
-        "email": email,
-        "message": {**_message_summary(full), "body": _extract_text_body(full.get("payload"))},
-    }
-
-
-@mcp.tool()
-async def gmail_send(to: str, subject: str, body: str, email: str | None = None) -> dict[str, Any]:
-    """Send an email (plain text) from the signed-in account."""
-    email = await _resolve_email(email)
-    mime = (
-        f"To: {to}\r\n"
-        f"Subject: {subject}\r\n"
-        'Content-Type: text/plain; charset="UTF-8"\r\n\r\n'
-        f"{body}"
-    )
-    raw = base64.urlsafe_b64encode(mime.encode("utf-8")).decode("ascii")
-    result = await _gapi(email, "gmail", "/users/me/messages/send", method="POST", body={"raw": raw})
-    if not result["ok"]:
-        return result
-    return {"ok": True, "email": email, "sent": {"id": result["data"].get("id"), "to": to, "subject": subject}}
-
-
-@mcp.tool()
-async def drive_search(
-    query: str = "",
-    email: str | None = None,
-    max_results: int = 10,
-) -> dict[str, Any]:
-    """Search Google Drive files. `query` is Drive search syntax (e.g. "name contains 'report'", "mimeType='application/vnd.google-apps.document'"); empty lists recent files."""
-    email = await _resolve_email(email)
-    params: dict[str, Any] = {
-        "pageSize": max(1, min(max_results, 50)),
-        "fields": "files(id,name,mimeType,size,modifiedTime,webViewLink)",
-        "orderBy": "modifiedTime desc",
-    }
-    if query:
-        params["q"] = query
-    result = await _gapi(email, "drive", "/files", params=params)
-    if not result["ok"]:
-        return result
-    return {"ok": True, "email": email, "files": result["data"].get("files", [])}
-
-
-@mcp.tool()
-async def calendar_events(
-    email: str | None = None,
-    time_min: str | None = None,
-    time_max: str | None = None,
-    max_results: int = 20,
-) -> dict[str, Any]:
-    """List primary-calendar events between ISO datetimes `time_min`/`time_max` (e.g. "2026-09-28T00:00:00+08:00"). Both optional — defaults cover now to +7 days."""
-    from datetime import datetime, timedelta, timezone
-
-    email = await _resolve_email(email)
-    now = datetime.now(timezone.utc)
-    tmin = time_min or (now - timedelta(hours=1)).isoformat()
-    tmax = time_max or (now + timedelta(days=7)).isoformat()
-    result = await _gapi(
-        email,
-        "calendar",
-        "/calendars/primary/events",
-        params={
-            "timeMin": tmin,
-            "timeMax": tmax,
-            "singleEvents": True,
-            "orderBy": "startTime",
-            "maxResults": max(1, min(max_results, 50)),
-        },
-    )
-    if not result["ok"]:
-        return result
-    events = [
-        {
-            "id": e.get("id"),
-            "summary": e.get("summary"),
-            "start": (e.get("start") or {}).get("dateTime") or (e.get("start") or {}).get("date"),
-            "end": (e.get("end") or {}).get("dateTime") or (e.get("end") or {}).get("date"),
-            "location": e.get("location"),
-            "hangoutLink": e.get("hangoutLink"),
-        }
-        for e in result["data"].get("items", [])
-    ]
-    return {"ok": True, "email": email, "events": events}
+        return err(result, email)
+    return ok(email, identity=result["data"])
 
 
 @mcp.tool()
@@ -278,17 +198,23 @@ async def gapi(
 
     Args:
         service: gmail/drive/calendar/docs/sheets/slides/people/chat/tasks/oauth2/admin
-        path: REST path, e.g. "/users/me/labels", "/documents/<docId>"
+        path: REST path, e.g. "/users/me/labels", "/documents/<docId>". Quote special chars.
         method: GET/POST/PUT/PATCH/DELETE
         params: query parameters
         body: JSON request body
-        version: API version override (defaults: gmail v1, drive v3, calendar v3, docs v1, sheets v4, ...)
+        version: API version override (defaults: gmail v1, drive v3, calendar v3, docs v1, sheets v4, slides v1, chat v1, tasks v1, people v1)
     """
-    email = await _resolve_email(email)
-    result = await _gapi(email, service, path, method, params, body, version)
+    email = await resolve_email(email)
+    result = await gapi_call(email, service, path, method, params, body, version)
     if result["ok"]:
-        return {"ok": True, "email": email, "data": result["data"]}
-    return {"ok": False, "email": email, "status": result["status"], "error": result.get("error")}
+        return ok(email, data=result["data"])
+    return err(result, email)
 
 
-__all__ = ["mcp", "tokens"]
+# import tool modules — each registers tools on the shared mcp instance
+from . import tools_gmail, tools_drive, tools_calendar, tools_workspace  # noqa: E402,F401
+
+__all__ = [
+    "mcp", "tokens", "gapi_call", "resolve_email", "ok", "err",
+    "decode_b64url", "extract_text_body", "message_summary", "MAX_TEXT",
+]

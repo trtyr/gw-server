@@ -49,7 +49,9 @@ DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/directory.readonly",
     "https://www.googleapis.com/auth/presentations.readonly",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/contacts.readonly",
 ]
 
 

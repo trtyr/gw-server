@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,26 @@ class Config:
     port: int
     cloud_fn_url: str
     public_url: str
+
+    @property
+    def oauth_client(self) -> tuple[str, str] | None:
+        """Own OAuth client (id, secret) for the standard code flow, if configured.
+
+        Sources (first wins): GW_CLIENT_ID/GW_CLIENT_SECRET env, credentials.json
+        (installed/web — same file the node skill used for local mode).
+        """
+        cid = os.environ.get("GW_CLIENT_ID", "").strip()
+        csec = os.environ.get("GW_CLIENT_SECRET", "").strip()
+        if cid and csec:
+            return cid, csec
+        try:
+            raw = json.loads(self.credentials_path.read_text("utf-8"))
+            creds = raw.get("installed") or raw.get("web") or {}
+            if creds.get("client_id") and creds.get("client_secret"):
+                return creds["client_id"], creds["client_secret"]
+        except (OSError, ValueError):
+            pass
+        return None
 
     @classmethod
     def from_env(cls) -> "Config":

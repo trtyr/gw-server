@@ -24,6 +24,7 @@ class Config:
     host: str
     port: int
     cloud_fn_url: str
+    public_url: str
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -54,6 +55,11 @@ class Config:
             cloud_fn_url=os.environ.get(
                 "GW_CLOUD_FN_URL", DEFAULT_CLOUD_FUNCTION_URL
             ).rstrip("/"),
+            # Public base URL for OAuth callbacks. On a headless server set this
+            # to the public origin (e.g. https://gw.trtyr.top) so the user can
+            # complete login from any browser; locally localhost works.
+            public_url=os.environ.get("GW_PUBLIC_URL", "").rstrip("/")
+            or f"http://localhost:{os.environ.get('GW_PORT', '8787')}",
         )
 
 

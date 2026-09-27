@@ -12,19 +12,23 @@ workspace.js CLI behaviour; only gateway auth failures produce HTTP 401.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import secrets
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import __version__
 from .config import config
+from .login import DEFAULT_CLIENT_ID, DEFAULT_SCOPES
 from .mcp_server import mcp, tokens
 from .tokens import (
     SERVICE_ROUTES,
@@ -110,12 +114,7 @@ class BearerASGIMiddleware:
         await self.app(scope, receive, send)
 
 
-# Mount the MCP server (Streamable HTTP) behind bearer auth.
-# Mounted at "/" so the MCP-internal route ("/mcp") resolves directly;
-# explicit API routes above take precedence. NOTE: reuse mcp_app — calling
-# streamable_http_app() again would create a second, un-started session manager.
-app.mount("/", BearerASGIMiddleware(mcp_app))
-
+# Mount the MCP server LAST — see bottom of file.
 def require_bearer(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
@@ -254,3 +253,141 @@ async def exec_api(
         "data": data,
         "elapsedMs": elapsed_ms,
     }
+
+
+# --------------------------------------------------------------------------
+# OAuth login (headless-server friendly)
+#
+# GET /oauth/login?email=... (Bearer) -> {url}   user opens the URL in ANY browser
+# Google -> cloud function (code exchange) -> 302 -> {public_url}/oauth/callback
+# GET /oauth/callback -> validate state, verify identity, store token
+#
+# No local browser or localhost callback required: on a server, set
+# GW_PUBLIC_URL=https://gw.trtyr.top and the whole flow works from a link.
+# --------------------------------------------------------------------------
+
+_pending_oauth: dict[str, tuple[str, float]] = {}  # csrf -> (email, expires_at monotonic)
+OAUTH_PENDING_TTL_S = 600
+
+
+@app.get("/oauth/login")
+async def oauth_login(
+    email: str, authorization: str | None = Header(default=None)
+) -> dict[str, Any]:
+    require_bearer(authorization)
+    email = normalize_email(email)
+
+    now = time.monotonic()
+    for k in [k for k, (_, exp) in _pending_oauth.items() if exp < now]:
+        _pending_oauth.pop(k, None)
+
+    csrf = secrets.token_hex(32)
+    _pending_oauth[csrf] = (email, now + OAUTH_PENDING_TTL_S)
+
+    state = base64.b64encode(
+        json.dumps(
+            {
+                "uri": f"{config.public_url}/oauth/callback",
+                "manual": False,
+                "csrf": csrf,
+            }
+        ).encode()
+    ).decode()
+
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(
+        {
+            "client_id": DEFAULT_CLIENT_ID,
+            "redirect_uri": config.cloud_fn_url,
+            "response_type": "code",
+            "access_type": "offline",
+            "scope": " ".join(DEFAULT_SCOPES),
+            "state": state,
+            "prompt": "consent",
+        }
+    )
+    log.info("oauth login initiated for %s (callback %s)", email, config.public_url)
+    return {
+        "ok": True,
+        "email": email,
+        "url": auth_url,
+        "callbackUrl": f"{config.public_url}/oauth/callback",
+        "expiresIn": OAUTH_PENDING_TTL_S,
+        "hint": "Open this URL in any browser, complete Google consent; "
+        "the token lands on this server automatically.",
+    }
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request) -> HTMLResponse:
+    qs = {k: v[0] for k, v in urllib.parse.parse_qs(request.url.query).items()}
+    # The cloud function echoes back the csrf token itself as `state`
+    # (not the base64 JSON we originally sent — matches node common.js,
+    # which compares returnedState === csrfToken).
+    state_raw = qs.get("state", "")
+    if state_raw in _pending_oauth:
+        csrf = state_raw
+    else:
+        # fallback: tolerate a full base64-JSON echo
+        try:
+            csrf = json.loads(base64.b64decode(state_raw)).get("csrf", "")
+        except Exception:
+            csrf = ""
+    pending = _pending_oauth.pop(csrf, None) if csrf else None
+    if pending is None or pending[1] < time.monotonic():
+        return HTMLResponse(
+            "<h1>❌ Invalid or expired OAuth state</h1><p>Re-initiate login.</p>",
+            status_code=400,
+        )
+    email = pending[0]
+
+    if qs.get("error"):
+        return HTMLResponse(
+            f"<h1>❌ Authentication failed: {qs['error']}</h1>", status_code=400
+        )
+    access = qs.get("access_token")
+    expiry_raw = qs.get("expiry_date")
+    if not access or not expiry_raw:
+        return HTMLResponse(
+            "<h1>❌ Callback did not include tokens</h1>", status_code=400
+        )
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access}"},
+        )
+    if resp.status_code != 200:
+        return HTMLResponse(
+            "<h1>❌ Identity check failed</h1>", status_code=400
+        )
+    identity = normalize_email(str(resp.json().get("email", "")))
+    if identity != email:
+        return HTMLResponse(
+            f"<h1>❌ Authenticated as {identity}, expected {email}.</h1>"
+            f"<p>Re-initiate login with --email {identity} or sign in with the right account.</p>",
+            status_code=400,
+        )
+
+    tokens.save(
+        email,
+        {
+            "access_token": access,
+            "refresh_token": qs.get("refresh_token"),
+            "scope": qs.get("scope"),
+            "token_type": qs.get("token_type", "Bearer"),
+            "expiry_date": int(expiry_raw),
+        },
+    )
+    log.info("oauth login complete for %s", email)
+    return HTMLResponse(
+        f"<h1>✅ Login successful for {email}</h1>"
+        f"<p>Token stored on the server. You can close this tab.</p>"
+    )
+
+
+# --------------------------------------------------------------------------
+# Mount the MCP server (Streamable HTTP) behind bearer auth — LAST, so the
+# explicit routes above (/healthz, /accounts, /exec, /oauth/*) win the match;
+# everything else falls through to MCP. NOTE: reuse mcp_app — calling
+# streamable_http_app() again would create a second, un-started session manager.
+app.mount("/", BearerASGIMiddleware(mcp_app))

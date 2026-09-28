@@ -65,7 +65,7 @@ log = logging.getLogger("gw.server")
 # (Host must be localhost); on 0.0.0.0 (production behind EdgeOne/Caddy) it
 # stays off so the proxy's Host header (gw.trtyr.top) is accepted.
 mcp_app = mcp.streamable_http_app(
-    stateless_http=True, json_response=True, host=config.host
+    stateless_http=True, json_response=True, host=config.mcp_host
 )
 _mcp_lifespan = mcp_app.router.lifespan_context
 

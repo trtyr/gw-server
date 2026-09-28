@@ -22,6 +22,7 @@ class Config:
     credentials_path: Path
     auth_mode: str | None  # "local" | "cloud" | None (auto per token file)
     host: str
+    mcp_host: str  # host fed to the MCP SDK (rebinding-protection decision)
     port: int
     cloud_fn_url: str
     public_url: str
@@ -69,6 +70,11 @@ class Config:
             ),
             auth_mode=mode or None,
             host=os.environ.get("GW_HOST", "127.0.0.1"),
+            # MCP Host-header validation target: keep 127.0.0.1 locally (SDK
+            # rebinding protection on); set 0.0.0.0 behind a reverse proxy so
+            # the proxy's Host header (gw.trtyr.top) is accepted.
+            mcp_host=os.environ.get("GW_MCP_HOST")
+            or os.environ.get("GW_HOST", "127.0.0.1"),
             port=int(os.environ.get("GW_PORT", "8787")),
             cloud_fn_url=os.environ.get(
                 "GW_CLOUD_FN_URL", DEFAULT_CLOUD_FUNCTION_URL

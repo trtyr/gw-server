@@ -1,6 +1,9 @@
 [project]
 name = "gw-server"
 version = "0.1.0"
+description = "Google Workspace MCP server - 45 tools behind a single bearer token"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.141.1",

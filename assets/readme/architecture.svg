@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">gw-server architecture</title>
+  <desc id="desc">An MCP client connects over HTTPS through an EdgeOne edge and Caddy TLS to gw-server, which holds OAuth tokens and calls Google Workspace APIs.</desc>
+  <rect width="1200" height="360" rx="24" fill="#0B0E14"/>
+
+  <g id="nodes" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <!-- node 1: client -->
+    <g transform="translate(64 64)">
+      <rect width="232" height="124" rx="12" fill="#141926" stroke="#2A3245" stroke-width="1.5"/>
+      <text x="20" y="36" font-size="19" fill="#E8EAF0">MCP client</text>
+      <text x="20" y="66" font-size="15" fill="#8B93A7">pi · Claude · anything</text>
+      <text x="20" y="90" font-size="15" fill="#8B93A7">one URL + one token</text>
+    </g>
+    <!-- node 2: edge -->
+    <g transform="translate(344 64)">
+      <rect width="232" height="124" rx="12" fill="#141926" stroke="#2A3245" stroke-width="1.5"/>
+      <text x="20" y="36" font-size="19" fill="#E8EAF0">edge</text>
+      <text x="20" y="66" font-size="15" fill="#8B93A7">EdgeOne · HTTPS</text>
+      <text x="20" y="90" font-size="15" fill="#8B93A7">CDN · DDoS shield</text>
+    </g>
+    <!-- node 3: caddy -->
+    <g transform="translate(624 64)">
+      <rect width="232" height="124" rx="12" fill="#141926" stroke="#2A3245" stroke-width="1.5"/>
+      <text x="20" y="36" font-size="19" fill="#E8EAF0">Caddy</text>
+      <text x="20" y="66" font-size="15" fill="#8B93A7">TLS · Let&#39;s Encrypt</text>
+      <text x="20" y="90" font-size="15" fill="#8B93A7">auto-renew · reverse proxy</text>
+    </g>
+    <!-- node 4: gw-server -->
+    <g transform="translate(904 64)">
+      <rect width="232" height="124" rx="12" fill="#141926" stroke="#4285F4" stroke-width="1.5"/>
+      <text x="20" y="36" font-size="19" fill="#4285F4">gw-server</text>
+      <text x="20" y="66" font-size="15" fill="#8B93A7">45 tools · Streamable HTTP</text>
+      <text x="20" y="90" font-size="15" fill="#8B93A7">OAuth tokens · auto refresh</text>
+    </g>
+
+    <!-- arrows -->
+    <g stroke="#8B93A7" stroke-width="1.5">
+      <line x1="296" y1="126" x2="336" y2="126"/>
+      <line x1="576" y1="126" x2="616" y2="126"/>
+      <line x1="856" y1="126" x2="896" y2="126"/>
+    </g>
+    <g fill="#8B93A7">
+      <path d="M336 126 l-8 -4 v8 z"/>
+      <path d="M616 126 l-8 -4 v8 z"/>
+      <path d="M896 126 l-8 -4 v8 z"/>
+    </g>
+    <g font-size="14" fill="#8B93A7" text-anchor="middle">
+      <text x="316" y="112">https</text>
+      <text x="596" y="112">https</text>
+      <text x="876" y="112">http</text>
+    </g>
+  </g>
+
+  <!-- Google band -->
+  <g id="google-band" transform="translate(64 240)">
+    <rect width="1072" height="72" rx="12" fill="#141926"/>
+    <text x="24" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17" fill="#C9CEDA">googleapis.com</text>
+    <text x="220" y="44" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#8B93A7">OAuth tokens stay on the server · refreshed automatically</text>
+    <g transform="translate(920 26)">
+      <rect x="0"   width="16" height="16" rx="4" fill="#2684FC"/>
+      <rect x="24"  width="16" height="16" rx="4" fill="#DB4437"/>
+      <rect x="48"  width="16" height="16" rx="4" fill="#EA4335"/>
+      <rect x="72"  width="16" height="16" rx="4" fill="#34A853"/>
+      <rect x="96"  width="16" height="16" rx="4" fill="#4285F4"/>
+      <rect x="120" width="16" height="16" rx="4" fill="#F4B400"/>
+      <rect x="144" width="16" height="16" rx="4" fill="#0F9D58"/>
+      <rect x="168" width="16" height="16" rx="4" fill="#00AC47"/>
+    </g>
+    <line x1="976" y1="126" x2="976" y2="212" stroke="#2A3245" stroke-width="1.5"/>
+    <path d="M976 212 l-4 -8 h8 z" fill="#8B93A7"/>
+  </g>
+</svg>

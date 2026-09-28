@@ -90,14 +90,42 @@ Mac 本地亦可用 CLI：`uv run python -m gw_server.login --email user@gmail.c
 - `GET /accounts`（Bearer）
 - `POST /exec`（Bearer）— REST 代理调试口
 
-## 部署（sg）
+## 部署（任意 VPS）
 
 ```bash
-rsync -az --exclude .venv --exclude .git -e "ssh -p 2222" ./ tencent-sg:/opt/gw-server/
-ssh -p 2222 tencent-sg 'cd /opt/gw-server && ~/.local/bin/uv sync'
-scp -P 2222 -r ~/.gw-server tencent-sg:/root/
-# systemd unit: /etc/systemd/system/gw-server.service（GW_TOKEN=credentials域 gw_api_token）
+# 1. server: install uv, sync deps
+rsync -az --exclude .venv --exclude .git ./ server:/opt/gw-server/
+ssh server 'cd /opt/gw-server && ~/.local/bin/uv sync'
+
+# 2. copy data dir (tokens/ + credentials.json, chmod 600)
+rsync -az -e ssh ~/.gw-server server:/root/
+
+# 3. systemd unit (see below), then:
 systemctl enable --now gw-server
 ```
 
-安全组：TCP 80（EdgeOne 回源）+ TCP 2222（SSH）。
+`gw-server.service`（要点）：
+
+```ini
+[Service]
+WorkingDirectory=/opt/gw-server
+ExecStart=/root/.local/bin/uv run --project /opt/gw-server gw-server
+Environment=GW_TOKEN=<openssl rand -hex 32>
+Environment=GW_HOST=127.0.0.1            # behind a reverse proxy
+Environment=GW_PORT=8080
+Environment=GW_PUBLIC_URL=https://<your-domain>
+Environment=GW_MCP_HOST=0.0.0.0          # accept proxy Host header
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=always
+```
+
+前置 Caddy 反代（自动 HTTPS）：
+
+```caddyfile
+<your-domain> {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+放行防火墙：80/443（ACME + HTTPS）。
+
